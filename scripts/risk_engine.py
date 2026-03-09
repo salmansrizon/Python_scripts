@@ -9,6 +9,7 @@ from datetime import datetime
 from openpyxl import Workbook
 import urllib.parse
 import re
+import networkx as nx
 from collections import defaultdict
 from sqlalchemy import create_engine, text
 import sys
@@ -19,8 +20,11 @@ from utils.log_file import LogManager
 log_manager = LogManager()
 logger = __import__('logging').getLogger(__name__)
 logger.info("="*80)
-logger.info("STARTING RISK ENGINE SCRIPT")
+logger.info("STARTING CUSTOMER SEGMENTATION SCRIPT")
 logger.info("="*80)
+
+# %% [markdown]
+# **Read Data**
 
 # %%
 # Database configuration
@@ -67,6 +71,7 @@ logger.info("Starting data cleaning and filtering process")
 initial_count = len(df)
 df.dropna(subset=["PaymentMethod"], inplace=True)
 logger.info(f"Dropped records with null PaymentMethod: {initial_count - len(df)} records removed, {len(df)} remaining")
+
 before_packaging = len(df)
 df = df[~df["deepestcategory"]
 
@@ -74,6 +79,11 @@ df = df[~df["deepestcategory"]
 
         .str.contains(r"\bpackaging materials?\b", case=False, na=False)]
 logger.info(f"Filtered packaging materials: {before_packaging - len(df)} records removed, {len(df)} remaining")
+
+# Remove Cartup Hub rows
+before_cartup = len(df)
+df = df[df["deepestcategory"].astype(str).str.strip().str.lower() != "cartup hub"]
+logger.info(f"Filtered Cartup Hub: {before_cartup - len(df)} records removed, {len(df)} remaining")
 
 before_seller = len(df)
 df = df[df['SellerId'] != 1]
@@ -147,7 +157,16 @@ df_valid = df.loc[
     )
 ].copy()
 logger.info(f"Filtered invalid customer status: {before_status_filter - len(df_valid)} records removed, {len(df_valid)} valid orders remaining")
- 
+
+# %% [markdown]
+# **Risk Thresholds**
+
+# %%
+AccountThreshold=5
+CancelReturnThreshold=0.6
+InvalidReturnPercent=0.4
+GISthreshold=5           # for Cancel and Return
+DeepCatThreshold=15
 
 # %% [markdown]
 # **Bring VoucherCode based on VoucherID**
@@ -370,6 +389,7 @@ logger.info(f"Phone level aggregation completed: {len(phone_df)} unique phone nu
 # FINAL MERGE
 # =============================
 logger.info("Merging device and phone aggregations")
+
 final_merged = pd.concat([device_df, phone_df], ignore_index=True)
 logger.info(f"Final merged dataset: {len(final_merged)} total entities (devices + phones)")
 
@@ -734,6 +754,7 @@ df["Phone_From_Address"] = df["Phone_From_Address"].astype("string")
 # RETURN LOGIC
 # =============================
 logger.info("Processing return logic and calculations")
+
 df["is_returned"] = df["IsQC"].notna() & (df["IsFailedDelivery"] == False)
 df["is_valid_return"] = (df["IsQC"] == True) & (df["IsFailedDelivery"] == False)
 df["is_invalid_return"] = (
@@ -743,7 +764,6 @@ df["is_invalid_return"] = (
     df["IsFailedDelivery"].notna()
 )
 
-df["requested_qty"] = df["OrderQuantity"]
 df["returned_qty"] = df["OrderQuantity"].where(df["is_returned"], 0)
 df["valid_return_qty"] = df["OrderQuantity"].where(df["is_valid_return"], 0)
 df["invalid_return_qty"] = df["OrderQuantity"].where(df["is_invalid_return"], 0)
@@ -773,6 +793,7 @@ df["nmv_value"] = df["TotalPrice"].where(delivered_mask, 0)
 # BUILD ENTITY-LEVEL TABLE
 # =============================
 logger.info("Building entity-level summary tables")
+
 def build_entity_table(df, entity_col, entity_type, cancel_reasons):
 
     entity_df = df.copy()
@@ -1287,8 +1308,6 @@ final_entity_table = (
 # **Aggregating Product Info Table**
 
 # %%
-import pandas as pd
-
 # =====================================================
 # STEP 1: Clean df and prepare entity-level data
 # =====================================================
@@ -1298,43 +1317,49 @@ df_clean = (
     .assign(
         Entity=lambda x: x["Receiver Phone"].astype(str).str.strip(),
         EntityType="Phone",
-        DeepestCategory=lambda x: x.get("deepestcategory", x["cat1"])
+        DeepestCategory=lambda x: x.get("deepestcategory", x["cat1"]),
+        OrderDate=lambda x: pd.to_datetime(x["OrderDate"]).dt.date
     )
     .rename(columns={"cat1": "Category"})
 )
 
+# Remove invalid entities
 df_clean = df_clean[
     df_clean["Entity"].notna() &
     ~df_clean["Entity"].str.lower().isin(["nan", "none", ""])
 ]
 
 # =====================================================
-# STEP 2: Create entity_product_table
+# STEP 2: Create entity_product_table (Correct)
 # =====================================================
 
 entity_product_table = (
     df_clean
-    .groupby(["EntityType", "Entity", "Vertical", "Category"], as_index=False)
+    .groupby(
+        ["EntityType", "Entity", "OrderDate",
+         "Vertical", "Category", "DeepestCategory"],
+        as_index=False
+    )
     .agg(
         GIS=("OrderQuantity", "sum"),
         GOS=("CustomerOrderCode", "nunique"),
         GMV=("TotalPrice", "sum"),
         ShippingSubsidy=("CartupShipping", "sum"),
-        VoucherSubsidy=("VoucherDiscount", "sum"),
-        DeepestCategory=("DeepestCategory", "first")
+        VoucherSubsidy=("VoucherDiscount", "sum")
     )
 )
 
-# Ensure numeric types
-numeric_cols = ['GIS', 'GMV', 'ShippingSubsidy', 'VoucherSubsidy']
-entity_product_table[numeric_cols] = (
-    entity_product_table[numeric_cols]
-    .apply(pd.to_numeric, errors='coerce')
-    .fillna(0)
-)
+# Ensure numeric safety
+numeric_cols = ['GIS', 'GMV', 'ShippingSubsidy', 'VoucherSubsidy', 'GOS']
+
+for col in numeric_cols:
+    entity_product_table[col] = (
+        pd.to_numeric(entity_product_table[col], errors='coerce')
+        .fillna(0)
+    )
 
 # =====================================================
-# STEP 3: Ensure EntityGroupID exists in final_entity_table
+# STEP 3: Ensure EntityGroupID exists
 # =====================================================
 
 final_entity_table = final_entity_table.reset_index(drop=True)
@@ -1345,55 +1370,111 @@ if 'EntityGroupID' not in final_entity_table.columns:
     )
 
 # =====================================================
-# STEP 4: Create Bridge Table
+# STEP 4: Build Entity → EntityGroupID Mapping
 # =====================================================
 
-entity_group_bridge = (
+entity_mapping = (
     final_entity_table[['EntityGroupID', 'Entity']]
     .assign(Entity=lambda x: x['Entity'].astype(str).str.split(','))
     .explode('Entity')
 )
 
-entity_group_bridge['Entity'] = entity_group_bridge['Entity'].str.strip()
+entity_mapping['Entity'] = (
+    entity_mapping['Entity']
+    .astype(str)
+    .str.strip()
+)
+
+# Remove empty values
+entity_mapping = entity_mapping[
+    entity_mapping['Entity'].notna() &
+    (entity_mapping['Entity'] != "")
+]
+
+# Keep one mapping per Entity
+entity_mapping = entity_mapping.drop_duplicates(
+    subset=['Entity']
+)
 
 # =====================================================
-# STEP 5: Join and Aggregate to EntityGroup level
+# STEP 5: Merge to Tag EntityGroupID
 # =====================================================
 
-entity_group_joined = entity_group_bridge.merge(
-    entity_product_table,
+entity_group_joined = entity_product_table.merge(
+    entity_mapping,
     on='Entity',
     how='left'
 )
 
-entity_group_joined[numeric_cols] = (
-    entity_group_joined[numeric_cols]
-    .apply(pd.to_numeric, errors='coerce')
-    .fillna(0)
-)
+# =====================================================
+# STEP 6: Aggregate to EntityGroup + Date Level
+# (Use MAX for GIS to prevent duplication)
+# =====================================================
 
 entity_group_product_table = (
     entity_group_joined
-    .groupby(['EntityGroupID', 'Vertical', 'Category'], as_index=False)
+    .groupby(
+        ['EntityGroupID', 'OrderDate',
+         'Vertical', 'Category', 'DeepestCategory'],
+        as_index=False
+    )
     .agg({
         'GIS': 'sum',
+        'GOS': 'sum',
         'GMV': 'sum',
         'ShippingSubsidy': 'sum',
-        'VoucherSubsidy': 'sum',
-        'DeepestCategory': 'first'
+        'VoucherSubsidy': 'sum'
     })
 )
 
+print("entity_group_product_table created successfully.")
+logger.info("entity_group_product_table created successfully")
 
 # %% [markdown]
 # **Shipping Details Table**
 
 # %%
-import pandas as pd
 
-# -----------------------------
-# Prepare base dataframe
-# -----------------------------
+# =====================================================
+# STEP 1: Ensure EntityGroupID exists
+# =====================================================
+
+final_entity_table = final_entity_table.reset_index(drop=True)
+
+if "EntityGroupID" not in final_entity_table.columns:
+    final_entity_table["EntityGroupID"] = (
+        "EG_" + (final_entity_table.index + 1).astype(str)
+    )
+
+# =====================================================
+# STEP 2: Build Clean Entity → EntityGroupID Mapping
+# =====================================================
+
+entity_mapping = (
+    final_entity_table[["EntityGroupID", "Entity"]]
+    .assign(Entity=lambda x: x["Entity"].astype(str).str.split(","))
+    .explode("Entity")
+)
+
+entity_mapping["Entity"] = (
+    entity_mapping["Entity"]
+    .astype(str)
+    .str.strip()
+)
+
+# Remove invalid entities
+entity_mapping = entity_mapping[
+    entity_mapping["Entity"].notna() &
+    (entity_mapping["Entity"] != "")
+]
+
+# Keep one mapping per Entity (prevents duplication)
+entity_mapping = entity_mapping.drop_duplicates(subset=["Entity"])
+
+# =====================================================
+# STEP 3: Prepare Base Shipping Data
+# =====================================================
+
 shipping_group_df = (
     df[[
         "Receiver Phone",
@@ -1404,12 +1485,19 @@ shipping_group_df = (
         "ShippingZone"
     ]]
     .assign(Entity=df["Receiver Phone"].astype(str).str.strip())
-    .merge(entity_group_bridge, on="Entity", how="inner")
+    .merge(entity_mapping, on="Entity", how="inner")
 )
 
-# -----------------------------
-# Aggregate at combination level
-# -----------------------------
+# Ensure numeric safety
+shipping_group_df["TotalPrice"] = (
+    pd.to_numeric(shipping_group_df["TotalPrice"], errors="coerce")
+    .fillna(0)
+)
+
+# =====================================================
+# STEP 4: Aggregate at EntityGroup + Shipping Level
+# =====================================================
+
 entity_group_shipping_table = (
     shipping_group_df
     .groupby(
@@ -1427,14 +1515,20 @@ entity_group_shipping_table = (
     )
 )
 
-# -----------------------------
-# Optional: sort for readability
-# -----------------------------
+# =====================================================
+# STEP 5: Sort for Readability
+# =====================================================
+
 entity_group_shipping_table = (
     entity_group_shipping_table
-    .sort_values(["EntityGroupID", "ShippingState", "ShippingCity", "ShippingZone"])
+    .sort_values(
+        ["EntityGroupID", "ShippingState", "ShippingCity", "ShippingZone"]
+    )
     .reset_index(drop=True)
 )
+
+print("entity_group_shipping_table created successfully (clean version).")
+logger.info("entity_group_shipping_table created successfully")
 
 
 # %% [markdown]
@@ -1455,7 +1549,6 @@ def normalize_abuse(val):
     ))
 
     return "; ".join(parts) if parts else "None"
-
 
 final_entity_table["AbuseType"] = (
     final_entity_table["AbuseType"]
@@ -1482,9 +1575,9 @@ def append_abuse(current, new):
 
 # 1) High Cancel / Return
 mask = (
-    (final_entity_table["GIS"] > 5) &
+    (final_entity_table["GIS"] > GISthreshold) &
     ((final_entity_table["CancelCount"] + final_entity_table["total_returned"])
-     >= 0.6 * final_entity_table["GIS"])
+     >= CancelReturnThreshold * final_entity_table["GIS"])
 )
 final_entity_table.loc[mask, "AbuseType"] = (
     final_entity_table.loc[mask, "AbuseType"]
@@ -1493,9 +1586,9 @@ final_entity_table.loc[mask, "AbuseType"] = (
 
 # 2) High Invalid Return
 mask = (
-    (final_entity_table["GIS"] > 5) &
+    (final_entity_table["GIS"] > GISthreshold) &
     (final_entity_table["total_invalid_return"]
-     >= 0.4 * final_entity_table["GIS"])
+     >= InvalidReturnPercent * final_entity_table["GIS"])
 )
 final_entity_table.loc[mask, "AbuseType"] = (
     final_entity_table.loc[mask, "AbuseType"]
@@ -1515,11 +1608,77 @@ final_entity_table.loc[mask, "AbuseType"] = (
 # 4) Multiple Accounts (Phone)
 mask = (
     (final_entity_table["EntityType"] == "Phone") &
-    (final_entity_table["NumOfAccounts"] > 5)
+    (final_entity_table["NumOfAccounts"] > AccountThreshold)
 )
 final_entity_table.loc[mask, "AbuseType"] = (
     final_entity_table.loc[mask, "AbuseType"]
     .apply(lambda x: append_abuse(x, "Multiple Accounts"))
+)
+
+# =============================
+# 5) Reseller
+# =============================
+
+# -----------------------------
+# A) Last 30 days check
+# -----------------------------
+max_date = entity_group_product_table["OrderDate"].max()
+cutoff_date = max_date - pd.Timedelta(days=30)
+
+recent_product = entity_group_product_table[
+    entity_group_product_table["OrderDate"] >= cutoff_date
+]
+
+recent_resellers = (
+    recent_product
+    .groupby(["EntityGroupID", "DeepestCategory"], as_index=False)["GIS"]
+    .sum()
+)
+
+recent_resellers = recent_resellers[
+    recent_resellers["GIS"] > DeepCatThreshold
+]["EntityGroupID"].unique()
+
+
+# -----------------------------
+# B) Monthly spike (from Oct 2025 onward)
+# -----------------------------
+start_date = pd.to_datetime("2025-10-01").date()
+
+monthly_product = entity_group_product_table[
+    entity_group_product_table["OrderDate"] >= start_date
+].copy()
+
+monthly_product["Year"] = pd.to_datetime(monthly_product["OrderDate"]).dt.year
+monthly_product["Month"] = pd.to_datetime(monthly_product["OrderDate"]).dt.month
+
+monthly_resellers = (
+    monthly_product
+    .groupby(
+        ["EntityGroupID", "Year", "Month", "DeepestCategory"],
+        as_index=False
+    )["GIS"]
+    .sum()
+)
+
+monthly_resellers = monthly_resellers[
+    monthly_resellers["GIS"] > DeepCatThreshold
+]["EntityGroupID"].unique()
+
+
+
+# -----------------------------
+# C) Combine both rules
+# -----------------------------
+reseller_groups = set(recent_resellers) | set(monthly_resellers)
+reseller_groups = list(reseller_groups)
+
+# Apply abuse label
+mask = final_entity_table["EntityGroupID"].isin(reseller_groups)
+
+final_entity_table.loc[mask, "AbuseType"] = (
+    final_entity_table.loc[mask, "AbuseType"]
+    .apply(lambda x: append_abuse(x, "Reseller"))
 )
 
 # =============================
@@ -1540,7 +1699,8 @@ risk_weights = {
     "High Cancel/Return": 2,
     "High Invalid Return": 2,
     "VoucherAbuser": 3,
-    "FreeShippingAbuser": 3
+    "FreeShippingAbuser": 3,
+    "Reseller": 4
 }
 
 # =============================
@@ -1620,39 +1780,63 @@ engine = create_engine(
 # Step 1: Prepare DataFrame
 # -----------------------------
 EntityGroupDF = entity_group_product_table.copy()
- 
+
 # Normalize column names
 EntityGroupDF.columns = (
     EntityGroupDF.columns
         .str.strip()
         .str.replace(" ", "", regex=False)
 )
- 
+
+# Ensure OrderDate is string (safe for PostgreSQL)
+if "OrderDate" in EntityGroupDF.columns:
+    EntityGroupDF["OrderDate"] = pd.to_datetime(
+        EntityGroupDF["OrderDate"], errors="coerce"
+    )
+
 # -----------------------------
 # Required columns
 # -----------------------------
-string_cols = ["EntityGroupID", "Vertical", "Category", "DeepestCategory"]
-numeric_cols = ["GIS", "GMV", "VoucherSubsidy", "ShippingSubsidy"]
- 
+string_cols = [
+    "EntityGroupID",
+    "Vertical",
+    "Category",
+    "DeepestCategory",
+    "OrderDate"
+]
+
+numeric_cols = [
+    "GIS",
+    "GMV",
+    "VoucherSubsidy",
+    "ShippingSubsidy"
+]
+
+# Ensure string columns exist
 for col in string_cols:
     if col not in EntityGroupDF.columns:
         EntityGroupDF[col] = "UNKNOWN"
-    EntityGroupDF[col] = EntityGroupDF[col].astype(str)
- 
+
+    if col != "OrderDate":
+        EntityGroupDF[col] = EntityGroupDF[col].astype(str)
+
+# Ensure numeric columns exist
 for col in numeric_cols:
     if col not in EntityGroupDF.columns:
         EntityGroupDF[col] = 0
+
     EntityGroupDF[col] = (
         pd.to_numeric(EntityGroupDF[col], errors="coerce")
-          .fillna(0)
+        .fillna(0)
     )
- 
+
 # -----------------------------
 # Final column order
 # -----------------------------
 EntityGroupDF = EntityGroupDF[
     [
         "EntityGroupID",
+        "OrderDate",
         "Vertical",
         "Category",
         "DeepestCategory",
@@ -1662,28 +1846,21 @@ EntityGroupDF = EntityGroupDF[
         "ShippingSubsidy"
     ]
 ]
- 
+
+
+
 # -----------------------------
-# Step 2: Drop table if exists
-# -----------------------------
-with engine.begin() as conn:
-    conn.execute(
-        text('DROP TABLE IF EXISTS "EntityGroup"')
-    )
- 
-# print("Existing EntityGroup table dropped (if existed)")
- 
-# -----------------------------
-# Step 3: Write DataFrame to table
+# Step 3: Write DataFrame to NEW table
 # -----------------------------
 EntityGroupDF.to_sql(
-    "EntityGroup",
+    "EntityGroup", #table name
     engine,
     if_exists="replace",
     index=False
 )
- 
-# print("EntityGroup table created successfully")
+
+print("EntityGroup table created successfully")
+logger.info("EntityGroup table created successfully")
 
 # %% [markdown]
 # **Push Shipping Details Table**
@@ -1755,7 +1932,8 @@ with engine.begin() as conn:
         text('DROP TABLE IF EXISTS "EntityGroupShipping"')
     )
  
-# print("Existing EntityGroupShipping table dropped (if existed)")
+print("Existing EntityGroupShipping table dropped (if existed)")
+logger.info("Existing EntityGroupShipping table dropped")
  
 # -----------------------------
 # Step 3: Write DataFrame to database
@@ -1767,7 +1945,8 @@ ShippingDF.to_sql(
     index=False
 )
  
-# print("EntityGroupShipping table created successfully")
+print("EntityGroupShipping table created successfully")
+logger.info("EntityGroupShipping table created successfully")
 
 # %% [markdown]
 # **Rename Columns**
@@ -1915,30 +2094,29 @@ CustomerProfiling = CustomerProfiling[
 # -----------------------------
 # Step 2: Drop tables if exist
 # -----------------------------
-logger.info("Preparing database: dropping existing CustomerProfiling tables")
 with engine.begin() as conn:
     conn.execute(text('DROP TABLE IF EXISTS "CustomerProfiling_staging"'))
     conn.execute(text('DROP TABLE IF EXISTS "CustomerProfiling"'))
-logger.debug("Existing tables dropped")
 
-# print("Existing CustomerProfiling tables dropped (if existed)")
+print("Existing CustomerProfiling tables dropped (if existed)")
+logger.info("Preparing database: dropping existing CustomerProfiling tables")
+logger.debug("Existing tables dropped")
 
 # -----------------------------
 # Step 3: Create staging table
 # -----------------------------
-logger.info(f"Creating staging table with {len(CustomerProfiling)} records and {len(CustomerProfiling.columns)} columns")
 CustomerProfiling.to_sql(
     "CustomerProfiling_staging",
     engine,
     if_exists="replace",
     index=False
 )
+logger.info(f"Creating staging table with {len(CustomerProfiling)} records and {len(CustomerProfiling.columns)} columns")
 logger.debug("Staging table created")
 
 # -----------------------------
 # Step 4: Create final table
 # -----------------------------
-logger.info("Creating final CustomerProfiling table")
 with engine.begin() as conn:
     conn.execute(text("""
         CREATE TABLE "CustomerProfiling" AS
@@ -1946,9 +2124,13 @@ with engine.begin() as conn:
         FROM "CustomerProfiling_staging";
     """))
 
+logger.info("Creating final CustomerProfiling table")
+print("CustomerProfiling table created successfully")
 logger.info("CustomerProfiling table created successfully")
 logger.info("="*80)
-logger.info("RISK ENGINE SCRIPT COMPLETED SUCCESSFULLY")
+logger.info("CUSTOMER SEGMENTATION SCRIPT COMPLETED SUCCESSFULLY")
 logger.info(f"Final dataset contains {len(CustomerProfiling)} customer entities")
 logger.info("="*80)
-print("CustomerProfiling table created successfully")
+
+
+
