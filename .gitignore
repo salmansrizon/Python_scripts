@@ -1,0 +1,9 @@
+/.agent
+/.dagster_home
+/.env
+/.venv
+/dagster_dev.log
+/howtostartdagsterincmd.txt
+/log
+**/__pycache__/
+service_account.json
